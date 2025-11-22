@@ -1,0 +1,563 @@
+{
+  "name": "AI-Powered Clinical Document Question-Answering Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "url": "=https://aztugprodsa01.blob.core.windows.net/documents/{{ $('Microsoft SQL1').item.json.file_path }}?sp=r&st=2025-10-13T17:47:20o&se=2025-10-14T02:02:20Z&spr=https&sv=2024-11-04&sr=h&sig=zASIVClgcM9Y0ObYjS2slxqmRNO5S3xYnFR4Nj3c1fQ%3D",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        80,
+        240
+      ],
+      "id": "cd6ff2bc-bdf8-4b27-b0fb-1a4b24657f08",
+      "name": "Download Pdf"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://aztugprodcv02.cognitiveservices.azure.com/vision/v3.2/read/analyze",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Ocp-Apim-Subscription-Key"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/pdf"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "b5faa660-79b2-455b-8634-2be0869f2a2f",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "url": "={{$items('HTTP Request')[0].json.headers['operation-location']}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Ocp-Apim-Subscription-Key"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        304,
+        48
+      ],
+      "id": "123f5463-d2e7-486a-aa9c-950d2a9962eb",
+      "name": "HTTP Request2"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0346d4a3-d7e0-40ff-bae5-05b4d4234022",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "running",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            },
+            {
+              "id": "fc4903fe-b249-4c23-a6f0-4d1f0fdddd35",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "notStarted",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        592,
+        32
+      ],
+      "id": "0bc1100c-0a4b-4fbf-92db-27aa9d8079f0",
+      "name": "If1"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        16
+      ],
+      "id": "a1752775-dd9c-43a1-a1f1-f42d5e841c3d",
+      "name": "Wait",
+      "webhookId": "5149a9cd-f3f7-431e-9e57-0923da89bce9"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== TUNEABLES =====\nconst CHARS_PER_CHUNK = 1200;  // target size of each chunk\nconst CHARS_OVERLAP    = 150;  // overlap to preserve context across chunks\nconst OCR_FALLBACK_NODE = 'HTTP Request2'; // only used if this node doesn't get OCR as input\n\n// ---------- 1) Get OCR JSON ----------\nconst ocr =\n  (Object.keys($json || {}).length ? $json : ($items(OCR_FALLBACK_NODE)[0]?.json)) || {};\n\n// ---------- 2) Normalize OCR -> [{ page, text }]\nlet readResults;\nif (Array.isArray(ocr.readResults)) {\n  // CV Read 3.x\n  readResults = ocr.readResults.map((p, i) => ({\n    page: p.page ?? p.pageNumber ?? i + 1,\n    text: (p.lines || []).map(l => l.text || '').join(' ')\n  }));\n} else if (Array.isArray(ocr.analyzeResult?.readResults)) {\n  // DI readResults\n  readResults = ocr.analyzeResult.readResults.map((p, i) => ({\n    page: p.page ?? p.pageNumber ?? i + 1,\n    text: (p.lines || []).map(l => l.text || '').join(' ')\n  }));\n} else if (Array.isArray(ocr.analyzeResult?.pages)) {\n  // DI pages with 'lines.content'\n  readResults = ocr.analyzeResult.pages.map((p, i) => ({\n    page: p.pageNumber ?? p.page ?? i + 1,\n    text: (p.lines || []).map(l => l.content || l.text || '').join(' ')\n  }));\n} else {\n  readResults = [];\n}\n\n// ---------- 3) Chunk a page’s text with overlap ----------\nfunction chunkPageText(txt, max = 1200, overlap = 150) {\n  const clean = String(txt || '').replace(/\\s+/g, ' ').trim();\n  if (!clean) return [];\n  // try to split on sentence boundaries but still pack to ~max chars\n  const sentences = clean.split(/(?<=[\\.\\!\\?])\\s+/g);\n  const chunks = [];\n  let buf = '';\n  for (const s of sentences) {\n    if ((buf + ' ' + s).trim().length <= max) {\n      buf = (buf ? buf + ' ' : '') + s;\n    } else {\n      if (buf) chunks.push(buf.trim());\n      // start next buffer; seed with overlap tail from previous\n      if (overlap > 0 && chunks.length) {\n        const tail = chunks[chunks.length - 1].slice(-overlap);\n        buf = (tail + ' ' + s).trim();\n      } else {\n        buf = s.trim();\n      }\n      // if buffer itself is longer than max, hard-slice\n      while (buf.length > max) {\n        chunks.push(buf.slice(0, max));\n        buf = buf.slice(Math.max(0, max - overlap));\n      }\n    }\n  }\n  if (buf) chunks.push(buf.trim());\n  return chunks;\n}\n\n// ---------- 4) Build chunks [{page, i, text}] ----------\nconst chunks = [];\nreadResults.forEach(p => {\n  const parts = chunkPageText(p.text, CHARS_PER_CHUNK, CHARS_OVERLAP);\n  parts.forEach((t, idx) => chunks.push({ page: p.page, i: idx, text: t }));\n});\n\n// Return a single item with all chunks\nreturn [{ json: { chunks } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        304
+      ],
+      "id": "15d113a1-c507-42ba-9609-f83a5ff09a46",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAzureOpenAi",
+      "typeVersion": 1,
+      "position": [
+        1184,
+        560
+      ],
+      "id": "5a073cd1-96af-4944-bfcc-fdb92c15095a",
+      "name": "Azure OpenAI Chat Model",
+      "credentials": {
+        "azureOpenAiApi": {
+          "id": "kWtuj8mLxRAu9s3x",
+          "name": "Azure Open AI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Question: {{ $json.Cat_prompt }}\nContext:\n{{ \n  ($('Code in JavaScript').item.json.chunks || [])\n    .map(c => `Page ${c.page}:\\n${c.text}`)\n    .join('\\n---\\n')\n}}",
+        "options": {
+          "systemMessage": "You are a strict extractor.\n\nReturn only a single JSON object and nothing else.\n\nSchema:\n- If {{ $json.question.endsWith('_status') }}: {\"status\": \"<string>\"}  (e.g., \"osteop\")\n- If {{ $json.question.endsWith('_value') }}: {\"value\": \"<number or -1>\"}\n- If {{ $json.question.endsWith('_date')  }}: {\"date\": \"<mm/dd/yyyy>\"}\n\nRules:\n- Decide from the provided Context only.\n- If you cannot find a value, use:\n  - status: \"\" (empty string)\n  - value: -1\n  - date: \"\" (empty string)\n- Date must be US format mm/dd/yyyy (e.g., 03/21/2025).\n- No extra keys, no prose, no explanations.\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        1216,
+        352
+      ],
+      "id": "c6a5689a-c089-4c8f-8da5-e80c819efd24",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read the one row that has the doc identifiers\nconst head = ($items('Microsoft SQL1')[0] || { json: {} }).json;\n\n// Read the AI Agent outputs (same order/length as the current items)\nconst aiItems = $items('AI Agent') || [];\n\n// helper: normalize whatever AI Agent returned into a string\nfunction pickResponse(aiJson) {\n  if (!aiJson) return '';\n  let o = aiJson.output ?? aiJson;\n\n  // If it came as a JSON string, parse it\n  if (typeof o === 'string') {\n    try { o = JSON.parse(o); } catch { return o; }\n  }\n\n  if (o && typeof o === 'object') {\n    // prefer value/date/status/answer, otherwise stringify\n    const r = o.value ?? o.date ?? o.status ?? o.answer;\n    return (r !== undefined && r !== null) ? String(r) : JSON.stringify(o);\n  }\n  return String(o ?? '');\n}\n\nconst out = items.map((it, idx) => {\n  const j = it.json;\n  const ai = (aiItems[idx] || {}).json;\n\n  return {\n    json: {\n      ai_doc_id: head.ai_doc_id ?? head.id ?? null,\n      doc_id:    head.doc_id,\n      emr_pid:   head.emr_pid,\n      category:  j.Cat_Name ?? j.category ?? 'psa',\n      question:  j.Cat_q    ?? j.question,\n      response:  pickResponse(ai),         // <-- now filled (e.g. \"0.573\" or \"02/20/2023\")\n      q_id:      j.q_id\n    }\n  };\n});\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1808,
+        256
+      ],
+      "id": "b3a87341-e2f8-4d17-93a3-d6050993b682",
+      "name": "Code in JavaScript3"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -720,
+        256
+      ],
+      "id": "bf8390ae-2edf-413b-9b56-96739e48762e",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": ";WITH cte AS\n(\n    SELECT TOP (1) id\n    FROM dbo.AI_Doc_Auto WITH (READPAST, ROWLOCK, UPDLOCK)\n    WHERE process_flag = 'to_process'\n    ORDER BY upload_date_time ASC, id ASC\n)\nUPDATE a\n   SET a.process_flag = 'processing'\nOUTPUT inserted.id         AS ai_doc_id,\n       inserted.emr_pid,\n       inserted.doc_id,\n       inserted.q_category,\n       inserted.file_path\n       \nFROM dbo.AI_Doc_Auto AS a\nJOIN cte ON a.id = cte.id;\n"
+      },
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.1,
+      "position": [
+        -528,
+        144
+      ],
+      "id": "72de7b84-b77f-48b2-9643-e5125d8377e2",
+      "name": "Microsoft SQL1",
+      "credentials": {
+        "microsoftSql": {
+          "id": "cRdSHoi7V9NDHGdo",
+          "name": "Microsoft SQL account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ai_doc_q_id, Cat_Name, Cat_q, Cat_prompt, Keywords, q_id\nFROM dbo.AI_Doc_Auto_Quest\nWHERE Cat_Name = N'{{$json[\"q_category\"]}}'\nORDER BY ai_doc_q_id;"
+      },
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.1,
+      "position": [
+        -320,
+        144
+      ],
+      "id": "47347be0-aefb-4a30-a8b2-66eb7c93088a",
+      "name": "Microsoft SQL2",
+      "credentials": {
+        "microsoftSql": {
+          "id": "cRdSHoi7V9NDHGdo",
+          "name": "Microsoft SQL account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "96e3b36f-86a2-4912-b6a9-83d26f0bb7f0",
+              "name": "Cat_prompt",
+              "value": "={{ $json.Cat_prompt }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -224,
+        336
+      ],
+      "id": "c44e90b2-8b87-47b1-9f37-c9ee26af52e9",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "mode": "combineBySql",
+        "query": "SELECT a.*, b.context, b.pagesUsed\nFROM input1 AS a\nCROSS JOIN input2 AS b;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        944,
+        464
+      ],
+      "id": "fa1c7e43-a601-40a8-a6a6-fd86868e6f86",
+      "name": "Merge1"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {
+          "includeUnpaired": true
+        }
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1536,
+        208
+      ],
+      "id": "837981ee-65a4-4a79-aefd-5c07cd095db2",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO dbo.AI_Doc_Auto_Resp\n  (ai_doc_id, doc_id, emr_pid, category, question, response, q_id)\nVALUES (\n  {{ $json.ai_doc_id ?? 'NULL' }},\n  {{ $json.doc_id }},\n  {{ $json.emr_pid }},\n  N'{{ String($json.category ?? \"\").replace(/'/g,\"''\") }}',\n  N'{{ String($json.question ?? \"\").replace(/'/g,\"''\") }}',\n  N'{{ String($json.response ?? \"\").replace(/'/g,\"''\") }}',\n  {{ $json.q_id }}\n);\n"
+      },
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.1,
+      "position": [
+        2128,
+        272
+      ],
+      "id": "ad1b8285-1460-4526-9fd1-d7b22e2f602a",
+      "name": "Microsoft SQL",
+      "credentials": {
+        "microsoftSql": {
+          "id": "RsZTTcYuPjCNyyiE",
+          "name": "Sample testing"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE dbo.AI_Doc_Auto\nSET process_flag = 'completed',\n    completed_date_time = SYSDATETIME()\nWHERE id = {{ $('Microsoft SQL1').item.json.ai_doc_id }} ;\n"
+      },
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.1,
+      "position": [
+        2384,
+        272
+      ],
+      "id": "46a1d238-350b-4b5e-b692-82ce3ad2bd24",
+      "name": "Microsoft SQL3",
+      "credentials": {
+        "microsoftSql": {
+          "id": "RsZTTcYuPjCNyyiE",
+          "name": "Sample testing"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Download Pdf": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request2": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Azure OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript3": {
+      "main": [
+        [
+          {
+            "node": "Microsoft SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Microsoft SQL1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Microsoft SQL1": {
+      "main": [
+        [
+          {
+            "node": "Microsoft SQL2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Microsoft SQL2": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Download Pdf",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge1": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Microsoft SQL": {
+      "main": [
+        [
+          {
+            "node": "Microsoft SQL3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "5e5badb1-b63b-4ee4-b418-6066d52c0e7a",
+  "meta": {
+    "instanceId": "2e73dc9401fc0dad025931b2dd78991a98c38f3f7b7443334d21c0208c6e67b5"
+  },
+  "id": "1Q5LzfEXAIKUkx6h",
+  "tags": []
+}
